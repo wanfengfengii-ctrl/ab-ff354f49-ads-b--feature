@@ -125,10 +125,24 @@ def test_duplicate_ids_rejected():
     assert post([pair, pair]).status_code == 422
 
 
-def test_wrong_frame_count_rejected():
-    assert post([{"id": "x", "frames": [frame(EVEN, 0)]}]).status_code == 422
+def test_too_many_frames_rejected():
     three = [frame(EVEN, 0), frame(ODD, 5_000), frame(EVEN, 6_000)]
     assert post([{"id": "x", "frames": three}]).status_code == 422
+
+
+def test_single_frame_without_reference_is_group_error():
+    # Missing reference is a stable per-group code, not a request-level 422:
+    # it must not shadow the other groups in the same batch.
+    resp = post([
+        {"id": "no-ref", "frames": [frame(EVEN, 6_000)]},
+        {"id": "good", "frames": [frame(EVEN, 6_000), frame(ODD, 1_000)]},
+    ])
+    assert resp.status_code == 200
+    results = {r["id"]: r for r in resp.json()["results"]}
+    assert results["no-ref"]["status"] == "error"
+    assert results["no-ref"]["error"]["code"] == "MISSING_REFERENCE"
+    assert results["no-ref"]["position"] is None
+    assert results["good"]["status"] == "ok"
 
 
 def test_numeric_ids_accepted_and_echoed():

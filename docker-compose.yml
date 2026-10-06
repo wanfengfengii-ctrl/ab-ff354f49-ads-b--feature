@@ -16,8 +16,10 @@ services:
     restart: unless-stopped
 
   # One-shot gate: builds the image (shared with api), waits for a healthy
-  # API, runs the unit tests and the interface smoke (valid pair + bad CRC),
-  # then exits. Its exit code reports the verdict:
+  # API, runs the unit tests and the interface smoke (double-frame
+  # regression, single-frame success, out-of-radius rejection and a legal
+  # antimeridian single frame), then exits. Its exit code reports the
+  # verdict:
   #   docker compose up --build --exit-code-from verify verify
   verify:
     image: adsb-decoder-api:latest

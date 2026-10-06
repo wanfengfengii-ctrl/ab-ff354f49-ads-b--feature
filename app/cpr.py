@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 
 from .errors import DecodeError
+from .geo import wrap_longitude_delta
 
 NZ = 15               # number of CPR latitude zones
 CPR_SCALE = 1 << 17   # 2^17 quantisation of the CPR fields
@@ -131,6 +132,60 @@ def global_decode(even, odd) -> tuple[float, float]:
     # Normalise to [-180, 180).
     if lon >= 180.0:
         lon -= 360.0
+    return lat, lon
+
+
+def local_decode(frame, ref_lat: float, ref_lon: float) -> tuple[float, float]:
+    """Decode one CPR frame locally against a trusted reference position.
+
+    The reference (a recent credible fix of the same target) removes the
+    global grid ambiguity: the latitude/longitude zone of the reference is
+    kept and the CPR fractions are reconstructed inside it, then the result
+    is snapped to whichever neighbouring zone copy is closest to the
+    reference -- this keeps targets hugging the antimeridian (and polar
+    latitudes) on the correct grid instead of landing a zone width away.
+
+    ``frame`` is a :class:`~app.adsb.PositionFrame`.  Returns ``(lat, lon)``
+    with longitude normalised to [-180, 180).
+    """
+    flag = 1 if frame.odd else 0
+    dlat = 360.0 / (4 * NZ - flag)
+    yz = frame.lat_cpr / CPR_SCALE
+
+    # Latitude zone containing the reference.
+    j = math.floor(ref_lat / dlat)
+    lat = dlat * (j + yz)
+    # Snap to the closest copy of the same encoded latitude (a zone width
+    # up or down); harmless mid-latitudes, decisive near the poles.
+    candidates = (lat - dlat, lat, lat + dlat)
+    lat = min(candidates, key=lambda cand: abs(cand - ref_lat))
+    if lat >= 270.0:
+        lat -= 360.0
+    if not -90.0 <= lat <= 90.0:
+        # A reference inside the polar cap where this CPR flag has no valid
+        # longitude zones can leave no in-range latitude candidate.
+        raise DecodeError(
+            "LOCAL_DECODE_FAILED",
+            f"locally decoded latitude {lat:.5f} is outside [-90, 90]",
+        )
+
+    ni = max(cpr_nl(lat) - flag, 1)
+    dlon = 360.0 / ni
+    xz = frame.lon_cpr / CPR_SCALE
+
+    # Longitude zone of the reference, measured on the same zone grid.
+    m = math.floor(ref_lon / dlon)
+    lon = dlon * (m + xz)
+    # Neighbouring zone copies -- wrap-aware -- pick the correct cell across
+    # the antimeridian and at zone boundaries.
+    lon = min(
+        (lon - dlon, lon, lon + dlon),
+        key=lambda cand: abs(wrap_longitude_delta(cand - ref_lon)),
+    )
+    if lon >= 180.0:
+        lon -= 360.0
+    if lon < -180.0:
+        lon += 360.0
     return lat, lon
 
 

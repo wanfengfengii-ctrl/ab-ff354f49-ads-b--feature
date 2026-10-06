@@ -2,7 +2,7 @@
 import pytest
 
 from app.adsb import build_position_message, parse_position_frame
-from app.cpr import cpr_nl, global_decode
+from app.cpr import cpr_nl, global_decode, local_decode
 from app.errors import DecodeError
 
 EVEN = "8D40621D58C382D690C8AC2863A7"
@@ -105,3 +105,88 @@ def test_cpr_nl_symmetry_and_extremes():
     assert cpr_nl(36.86) == 47
     assert cpr_nl(-52.2572) == cpr_nl(52.2572)
     assert cpr_nl(89.9) == 1
+
+
+# --------------------------------------------------------------------------
+# Local (single-frame) CPR decoding against a trusted reference.
+# --------------------------------------------------------------------------
+
+def local_roundtrip(lat, lon, odd, ref_lat=None, ref_lon=None):
+    raw = build_position_message("ABCDEF", lat, lon, odd=odd)
+    frame = parse_position_frame(raw, 1_000)
+    if ref_lat is None:
+        ref_lat, ref_lon = lat - 0.001, lon - 0.001
+    return local_decode(frame, ref_lat, ref_lon)
+
+
+def test_local_known_even_frame():
+    frame = parse_position_frame(EVEN, 6_000)
+    lat, lon = local_decode(frame, 52.25, 3.90)
+    assert (round(lat, 6), round(lon, 6)) == (52.257202, 3.919373)
+
+
+def test_local_known_odd_frame():
+    frame = parse_position_frame(ODD, 6_000)
+    lat, lon = local_decode(frame, 52.27, 3.95)
+    assert (round(lat, 6), round(lon, 6)) == (52.265780, 3.938913)
+
+
+LOCAL_CASES = [
+    (52.2572, 3.9194, False),
+    (52.2572, 3.9194, True),
+    (-33.8688, 151.2093, False),
+    (-33.8688, 151.2093, True),
+    (1.3521, 103.8198, False),
+    (0.0, 0.0, False),
+    (64.1466, -21.9426, True),
+    (-54.8, -68.3, False),
+    (71.0, 25.0, True),
+    (83.0, -130.0, False),
+    (83.0, -130.0, True),
+    (-83.0, 120.0, False),
+    (-83.0, 120.0, True),
+    (89.9, 10.0, False),  # polar cap, few longitude zones
+    (89.9, 10.0, True),
+    (-89.9, -10.0, False),
+    (-89.9, -10.0, True),
+]
+
+
+@pytest.mark.parametrize("lat,lon,odd", LOCAL_CASES)
+def test_local_roundtrip(lat, lon, odd):
+    dec_lat, dec_lon = local_roundtrip(lat, lon, odd)
+    lon_step = 360.0 / max(cpr_nl(lat) - (1 if odd else 0), 1) / 2**17
+    assert dec_lat == pytest.approx(lat, abs=1e-4)
+    assert dec_lon == pytest.approx(lon, abs=max(lon_step, 1e-4))
+    assert -180.0 <= dec_lon < 180.0
+
+
+@pytest.mark.parametrize("odd", [False, True])
+def test_local_antimeridian_east_and_west(odd):
+    # The encoded fix sits on one side; references on either side must each
+    # resolve the grid to that same 179.98 fix, wrapped to [-180, 180).
+    raw = build_position_message("ABCDEF", 10.0, 179.98, odd=odd)
+    frame = parse_position_frame(raw, 1_000)
+    for ref_lon in (179.95, -179.95):
+        lat, lon = local_decode(frame, 10.001, ref_lon)
+        assert lat == pytest.approx(10.0, abs=1e-4)
+        assert lon == pytest.approx(179.98, abs=1e-4)
+
+    raw = build_position_message("ABCDEF", 10.0, -179.98, odd=odd)
+    frame = parse_position_frame(raw, 1_000)
+    for ref_lon in (179.95, -179.95):
+        lat, lon = local_decode(frame, 10.001, ref_lon)
+        assert lon == pytest.approx(-179.98, abs=1e-4)
+
+
+@pytest.mark.parametrize("odd", [False, True])
+def test_local_decode_stays_within_half_zone_of_reference(odd):
+    # Aviation CPR local decoding resolves the ambiguity by reconstructing
+    # inside the reference's own grid cell, snapping at most half a zone:
+    # the fix can never be thrown a whole world away.  At mid-latitudes
+    # half a longitude zone is 5 degrees (even) or ~5.08 (odd).
+    raw = build_position_message("ABCDEF", 10.0, 179.98, odd=odd)
+    frame = parse_position_frame(raw, 1_000)
+    lat, lon = local_decode(frame, 10.0, 8.0)
+    dlon = 360.0 / max(cpr_nl(lat) - (1 if odd else 0), 1)
+    assert abs((lon - 8.0 + 180.0) % 360.0 - 180.0) <= dlon / 2.0 + 1e-9
