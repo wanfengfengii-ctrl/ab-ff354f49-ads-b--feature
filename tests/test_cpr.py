@@ -1,8 +1,8 @@
-"""Global CPR decoding: known vectors, round-trips, and boundary behaviour."""
+"""Global/local CPR decoding: known vectors, round-trips, boundaries."""
 import pytest
 
 from app.adsb import build_position_message, parse_position_frame
-from app.cpr import cpr_nl, global_decode
+from app.cpr import cpr_nl, global_decode, great_circle_distance_nm, local_decode
 from app.errors import DecodeError
 
 EVEN = "8D40621D58C382D690C8AC2863A7"
@@ -105,3 +105,115 @@ def test_cpr_nl_symmetry_and_extremes():
     assert cpr_nl(36.86) == 47
     assert cpr_nl(-52.2572) == cpr_nl(52.2572)
     assert cpr_nl(89.9) == 1
+
+
+# ---------------------------------------------------------------------------
+# Local (single-frame) CPR decoding against a trusted reference.
+# ---------------------------------------------------------------------------
+
+LOCAL_CASES = [
+    (52.2572, 3.9194, False),       # western Europe, even
+    (52.2658, 3.9389, True),        # western Europe, odd
+    (-33.8688, 151.2093, False),    # Sydney, southern hemisphere
+    (1.3521, 103.8198, True),       # Singapore, near the equator
+    (-54.8, -68.3, False),          # Ushuaia
+    (71.0, 25.0, True),             # high northern latitude
+    (83.0, -130.0, False),          # NL down to single digits
+    (-75.0, 45.0, True),            # Antarctica coast
+    (10.0, 179.97, False),          # just west of the antimeridian
+    (10.0, -179.97, True),          # just east of the antimeridian
+]
+
+
+@pytest.mark.parametrize("lat,lon,odd", LOCAL_CASES)
+def test_local_decode_lands_in_reference_cell(lat, lon, odd):
+    frame = parse_position_frame(build_position_message("ABCDEF", lat, lon, odd=odd), 6_000)
+    # Reference a short distance (~1 NM) away: the same parity cell wins.
+    ref_lat, ref_lon = lat + 0.015, lon + 0.015
+    dec_lat, dec_lon = local_decode(frame, ref_lat, ref_lon)
+    lat_step = 360.0 / (59 if odd else 60) / 2**17
+    lon_step = 360.0 / max(cpr_nl(lat) - (1 if odd else 0), 1) / 2**17
+    assert dec_lat == pytest.approx(lat, abs=max(lat_step, 1e-6))
+    assert dec_lon == pytest.approx(lon, abs=max(lon_step, 1e-6))
+    assert -180.0 <= dec_lon < 180.0
+
+
+def test_local_decode_known_even_frame():
+    frame = parse_position_frame(EVEN, 6_000)
+    lat, lon = local_decode(frame, 52.26, 3.92)
+    assert (round(lat, 6), round(lon, 6)) == (52.257202, 3.919373)
+
+
+def test_local_decode_known_odd_frame():
+    frame = parse_position_frame(ODD, 6_000)
+    lat, lon = local_decode(frame, 52.27, 3.94)
+    assert (round(lat, 6), round(lon, 6)) == (52.265780, 3.938913)
+
+
+def test_local_decode_antimeridian_wraps_to_nearest_cell():
+    # Target cell sits at -179.98 while the trusted reference is on the
+    # +179.99 side: local decode must wrap, not pick a cell ~360 degrees away.
+    frame = parse_position_frame(
+        build_position_message("ABCDEF", 10.0, -179.98, odd=False), 6_000
+    )
+    lat, lon = local_decode(frame, 10.0, 179.99)
+    assert lat == pytest.approx(10.0, abs=1e-4)
+    assert lon == pytest.approx(-179.98, abs=1e-4)
+    assert great_circle_distance_nm(10.0, 179.99, lat, lon) < 5.0
+
+
+def test_local_decode_antimeridian_east_to_west():
+    frame = parse_position_frame(
+        build_position_message("ABCDEF", -20.0, 179.98, odd=True), 6_000
+    )
+    lat, lon = local_decode(frame, -20.0, -179.99)
+    assert lon == pytest.approx(179.98, abs=1e-4)
+    assert great_circle_distance_nm(-20.0, -179.99, lat, lon) < 5.0
+
+
+def test_local_decode_polar_even_frame():
+    # Even frames keep longitude zones to the pole; a legal high-latitude
+    # single frame must land in the reference's cell.
+    frame = parse_position_frame(
+        build_position_message("ABCDEF", 85.0, 100.0, odd=False), 6_000
+    )
+    lat, lon = local_decode(frame, 85.01, 100.02)
+    assert lat == pytest.approx(85.0, abs=1e-3)
+    assert lon == pytest.approx(100.0, abs=1e-2)
+
+
+def test_local_decode_odd_frame_undefined_at_pole():
+    # An odd frame decoded to |lat| >= 87 (NL collapses to 1) has no
+    # longitude zone structure and must be refused, not silently guessed.
+    frame = parse_position_frame(
+        build_position_message("ABCDEF", 88.0, 100.0, odd=True), 6_000
+    )
+    with pytest.raises(DecodeError) as exc:
+        local_decode(frame, 88.0, 100.0)
+    assert exc.value.code == "POLAR_CPR_AMBIGUITY"
+
+
+def test_local_decode_distant_reference_picks_ambiguous_cell():
+    # The same CPR encoding repeats every few degrees: a reference on the
+    # far side of the ambiguity resolves to a *different* cell.  This is the
+    # case the caller's radius gate exists to reject.
+    frame = parse_position_frame(
+        build_position_message("ABCDEF", 52.2572, 3.9194, odd=False), 6_000
+    )
+    lat, lon = local_decode(frame, -33.8688, 151.2093)
+    assert great_circle_distance_nm(-33.8688, 151.2093, lat, lon) > 50.0
+
+
+@pytest.mark.parametrize(
+    "lat1,lon1,lat2,lon2,expected",
+    [
+        (0.0, 0.0, 0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0, 60.0),          # one degree longitude at equator ~ 60 NM
+        (10.0, 179.99, 10.0, -179.99, 1.2),  # short way across the antimeridian
+        (10.0, -179.99, 10.0, 179.99, 1.2),
+        (90.0, 0.0, 89.0, 0.0, 60.0),        # one degree latitude ~ 60 NM near pole
+    ],
+)
+def test_great_circle_distance_wraps_antimeridian(lat1, lon1, lat2, lon2, expected):
+    distance = great_circle_distance_nm(lat1, lon1, lat2, lon2)
+    assert distance == pytest.approx(expected, abs=0.1)

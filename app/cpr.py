@@ -1,9 +1,17 @@
-"""Global CPR (Compact Position Reporting) for airborne ADS-B positions.
+"""Global and local CPR (Compact Position Reporting) for airborne ADS-B.
 
-Implements the world-wide even/odd pair decoding defined by RTCA DO-260
-(see also ICAO Annex 10 Vol. IV): one even and one odd frame are combined
-to recover an unambiguous global position.  Longitude is normalised to
-[-180, 180) so tracks crossing the antimeridian stay on the correct side.
+Implements the decoders defined by RTCA DO-260 (see also ICAO Annex 10
+Vol. IV):
+
+* :func:`global_decode` combines one even and one odd frame to recover an
+  unambiguous global position.
+* :func:`local_decode` resolves a single frame against a trusted reference
+  point, choosing the CPR grid cell nearest the reference.  The caller is
+  responsible for sanity-checking the result against a maximum range so a
+  grid ambiguity can never place the target in a distant cell.
+
+Longitude is normalised to [-180, 180) so tracks crossing the antimeridian
+stay on the correct side.
 """
 from __future__ import annotations
 
@@ -13,6 +21,10 @@ from .errors import DecodeError
 
 NZ = 15               # number of CPR latitude zones
 CPR_SCALE = 1 << 17   # 2^17 quantisation of the CPR fields
+
+#: Mean Earth radius in nautical miles (6371 km / 1.852 km per NM), used by
+#: the haversine range check around locally decoded positions.
+EARTH_RADIUS_NM = 3440.065
 
 _DLAT_EVEN = 360.0 / (4 * NZ)       # 6.0 degrees
 _DLAT_ODD = 360.0 / (4 * NZ - 1)    # 360/59 degrees
@@ -132,6 +144,86 @@ def global_decode(even, odd) -> tuple[float, float]:
     if lon >= 180.0:
         lon -= 360.0
     return lat, lon
+
+
+def local_decode(frame, ref_lat: float, ref_lon: float) -> tuple[float, float]:
+    """Decode one CPR frame relative to a trusted nearby reference point.
+
+    ``frame`` is a :class:`~app.adsb.PositionFrame`; ``ref_lat`` /
+    ``ref_lon`` are decimal degrees of a contemporaneous reference fix.
+    The CPR cell of the correct parity nearest the reference is selected
+    independently for latitude and longitude; longitude is normalised to
+    [-180, 180), so a legal frame near the poles or the antimeridian
+    (reference at 179.99°, target cell at -179.99°) still lands on the
+    grid cell adjacent to the reference.  The caller must additionally
+    confirm the result lies within its acceptance radius (see
+    :func:`great_circle_distance_nm`) so a distant grid ambiguity is never
+    accepted.
+
+    Raises :class:`DecodeError` with code ``POLAR_CPR_AMBIGUITY`` for an
+    odd frame decoded above 87° latitude: NL collapses to 1 there, leaving
+    zero odd longitude zones.  Even frames keep one longitude zone to the
+    pole and remain decodable.
+    """
+    flag = 1 if frame.odd else 0
+    dlat = 360.0 / (4 * NZ - flag)
+
+    yz = frame.lat_cpr / CPR_SCALE
+    j = math.floor(ref_lat / dlat) + math.floor(
+        _fraction(ref_lat / dlat) - yz + 0.5
+    )
+    lat = dlat * (j + yz)
+
+    nl = cpr_nl(lat)
+    ni = nl - flag
+    if ni < 1:
+        # Odd frames above 87° (NL collapses to 1) carry no longitude zone
+        # structure; airborne odd CPR is geometrically undefined there.
+        raise DecodeError(
+            "POLAR_CPR_AMBIGUITY",
+            f"the {('odd' if frame.odd else 'even')} CPR frame cannot resolve "
+            f"longitude at latitude {lat:.3f}",
+        )
+    dlon = 360.0 / ni
+
+    xz = frame.lon_cpr / CPR_SCALE
+    m = math.floor(ref_lon / dlon) + math.floor(
+        _fraction(ref_lon / dlon) - xz + 0.5
+    )
+    lon = normalise_lon(dlon * (m + xz))
+    return lat, lon
+
+
+def _fraction(value: float) -> float:
+    """Fractional part of ``value`` in [0, 1), also for negative numbers."""
+    return value - math.floor(value)
+
+
+def normalise_lon(lon: float) -> float:
+    """Normalise any longitude to the half-open range [-180, 180)."""
+    return (lon + 180.0) % 360.0 - 180.0
+
+
+def great_circle_distance_nm(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> float:
+    """Great-circle distance between two fixes in nautical miles.
+
+    The haversine formula is evaluated on longitude differences wrapped to
+    [-180, 180), so fixes on opposite sides of the antimeridian
+    (179.99° and -179.99°) measure the short way across the line.
+    """
+    rlat1 = math.radians(lat1)
+    rlat2 = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians((lon2 - lon1 + 540.0) % 360.0 - 180.0)
+    h = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2.0) ** 2
+    )
+    # Clamp against floating-point overshoot before sqrt/asin.
+    h = min(1.0, max(0.0, h))
+    return 2.0 * EARTH_RADIUS_NM * math.asin(math.sqrt(h))
 
 
 def encode_position(lat: float, lon: float, odd: bool) -> tuple[int, int]:

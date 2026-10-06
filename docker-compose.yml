@@ -16,7 +16,8 @@ services:
     restart: unless-stopped
 
   # One-shot gate: builds the image (shared with api), waits for a healthy
-  # API, runs the unit tests and the interface smoke (valid pair + bad CRC),
+  # API, runs the unit tests and the interface smoke (two-frame regression,
+  # bad CRC, single-frame success/out-of-range/timing, antimeridian, polar),
   # then exits. Its exit code reports the verdict:
   #   docker compose up --build --exit-code-from verify verify
   verify:
